@@ -62,6 +62,8 @@ _HDFS_FILE_SECRETS = ["KERBEROS_KEYTAB", "TLS_CERT", "TLS_KEY", "TLS_CA"]
 
 # S3 parallel download configuration
 _S3_MAX_FILE_CONCURRENCY = int(os.getenv("S3_MAX_FILE_CONCURRENCY", "4"))
+# S3 CRT configuration
+_S3_USE_CRT = os.getenv("S3_USE_CRT", "true").lower() == "true"
 # Global variable for S3 resource in worker processes
 _worker_s3_resource = None
 # Azure async download configuration
@@ -261,6 +263,25 @@ class Storage(object):
         return kwargs
 
     @staticmethod
+    def _get_s3_transfer_config():
+        """
+        Get TransferConfig for S3 downloads with CRT support.
+
+        Returns:
+            TransferConfig: Configuration object for boto3 transfers
+        """
+        from boto3.s3.transfer import TransferConfig
+
+        if not _S3_USE_CRT:
+            # Return default config without CRT
+            return TransferConfig(use_threads=True)
+
+        # When boto3[crt] is installed, CRT is automatically used
+        # No special configuration needed - CRT handles parallelism internally
+        logger.info("S3 CRT enabled (auto-detected when awscrt is installed)")
+        return TransferConfig(use_threads=True)
+
+    @staticmethod
     def _init_s3_worker():
         """
         Initialize S3 resources for worker processes.
@@ -295,8 +316,11 @@ class Storage(object):
             bucket_name, obj_key, target_path = args
             bucket = _worker_s3_resource.Bucket(bucket_name)
 
-            # Download the file
-            bucket.download_file(obj_key, target_path)
+            # Get TransferConfig for CRT support
+            transfer_config = Storage._get_s3_transfer_config()
+
+            # Download the file with CRT-enabled TransferConfig
+            bucket.download_file(obj_key, target_path, Config=transfer_config)
 
             return True, obj_key, ""
 
@@ -349,24 +373,48 @@ class Storage(object):
                 "Failed to fetch model. No model found in %s." % bucket_path
             )
 
-        num_processes = min(_S3_MAX_FILE_CONCURRENCY, len(download_tasks))
-
-        with multiprocessing.Pool(
-            processes=num_processes, initializer=Storage._init_s3_worker
-        ) as pool:
-            results = pool.map(Storage._download_s3_object, download_tasks)
-
         # Process results and handle errors
         successful_downloads = []
         failed_downloads = []
 
-        for success, obj_key, error_msg in results:
-            if success:
-                successful_downloads.append(obj_key)
-                logger.info("Downloaded object %s" % obj_key)
-            else:
-                failed_downloads.append((obj_key, error_msg))
-                logger.error("Failed to download object %s: %s" % (obj_key, error_msg))
+        if _S3_USE_CRT:
+            # CRT mode: Process downloads serially with a single S3 client
+            # CRT handles parallelism internally, avoiding multi-process contention
+            logger.info(
+                "Using CRT with serial processing (%d files, CRT handles internal parallelism)",
+                len(download_tasks),
+            )
+            transfer_config = Storage._get_s3_transfer_config()
+            
+            for bucket_name, obj_key, target_path in download_tasks:
+                try:
+                    bucket = s3.Bucket(bucket_name)
+                    bucket.download_file(obj_key, target_path, Config=transfer_config)
+                    successful_downloads.append(obj_key)
+                    logger.info("Downloaded object %s" % obj_key)
+                except Exception as e:
+                    failed_downloads.append((obj_key, str(e)))
+                    logger.error("Failed to download object %s: %s" % (obj_key, str(e)))
+        else:
+            # Non-CRT mode: Use multiprocessing for parallelism
+            logger.info(
+                "Using multiprocessing without CRT (processes=%d)",
+                min(_S3_MAX_FILE_CONCURRENCY, len(download_tasks)),
+            )
+            num_processes = min(_S3_MAX_FILE_CONCURRENCY, len(download_tasks))
+
+            with multiprocessing.Pool(
+                processes=num_processes, initializer=Storage._init_s3_worker
+            ) as pool:
+                results = pool.map(Storage._download_s3_object, download_tasks)
+
+            for success, obj_key, error_msg in results:
+                if success:
+                    successful_downloads.append(obj_key)
+                    logger.info("Downloaded object %s" % obj_key)
+                else:
+                    failed_downloads.append((obj_key, error_msg))
+                    logger.error("Failed to download object %s: %s" % (obj_key, error_msg))
 
         if len(failed_downloads) > 0:
             error_details = "; ".join(
