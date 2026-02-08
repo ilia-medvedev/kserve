@@ -23,6 +23,7 @@ import multiprocessing
 import os
 import re
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import time
@@ -277,10 +278,63 @@ class Storage(object):
             _worker_s3_resource = None
 
     @staticmethod
+    def _download_s3_object_s5cmd(bucket_name: str, obj_key: str, target_path: str) -> Tuple[bool, str, str]:
+        """
+        Download a single S3 object using s5cmd command-line tool.
+
+        Args:
+            bucket_name: S3 bucket name
+            obj_key: S3 object key
+            target_path: Local file path to save the downloaded object
+
+        Returns:
+            Tuple of (success: bool, obj_key: str, error_message: str)
+        """
+        try:
+            s3_uri = f"s3://{bucket_name}/{obj_key}"
+            cmd = ["s5cmd", "cp", s3_uri, target_path]
+
+            logger.info("Downloading with s5cmd: %s -> %s", s3_uri, target_path)
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            # Log stdout if present
+            if result.stdout:
+                logger.info("s5cmd stdout: %s", result.stdout.strip())
+
+            # Log stderr if present
+            if result.stderr:
+                if result.returncode == 0:
+                    logger.info("s5cmd stderr: %s", result.stderr.strip())
+                else:
+                    logger.error("s5cmd stderr: %s", result.stderr.strip())
+
+            # Check if command was successful
+            if result.returncode != 0:
+                error_msg = f"s5cmd failed with exit code {result.returncode}: {result.stderr}"
+                return False, obj_key, error_msg
+
+            logger.info("Successfully downloaded with s5cmd: %s", obj_key)
+            return True, obj_key, ""
+
+        except FileNotFoundError:
+            error_msg = "s5cmd command not found. Please ensure s5cmd is installed and in PATH"
+            logger.error(error_msg)
+            return False, obj_key, error_msg
+        except Exception as e:
+            return False, obj_key, str(e)
+
+    @staticmethod
     def _download_s3_object(args: Tuple) -> Tuple[bool, str, str]:
         """
         Worker function to download a single S3 object in a separate process.
-        Uses pre-initialized S3 resource from _init_s3_worker().
+        Uses s5cmd CLI tool if USE_S5CMD environment variable is set to true,
+        otherwise uses pre-initialized S3 resource from _init_s3_worker().
 
         Args:
             args: Tuple containing (bucket_name:str, obj_key:str, target_path:str)
@@ -289,16 +343,24 @@ class Storage(object):
             Tuple of (success: bool, obj_key: str, error_message: str)
         """
         try:
-            if _worker_s3_resource is None:
-                return False, args[1], "S3 resource not initialized in worker process"
-
             bucket_name, obj_key, target_path = args
-            bucket = _worker_s3_resource.Bucket(bucket_name)
 
-            # Download the file
-            bucket.download_file(obj_key, target_path)
+            # Check if s5cmd should be used instead of boto3
+            use_s5cmd = os.getenv("USE_S5CMD", "false").lower() == "true"
 
-            return True, obj_key, ""
+            if use_s5cmd:
+                return Storage._download_s3_object_s5cmd(bucket_name, obj_key, target_path)
+            else:
+                # Use boto3 (original implementation)
+                if _worker_s3_resource is None:
+                    return False, obj_key, "S3 resource not initialized in worker process"
+
+                bucket = _worker_s3_resource.Bucket(bucket_name)
+
+                # Download the file
+                bucket.download_file(obj_key, target_path)
+
+                return True, obj_key, ""
 
         except Exception as e:
             return False, obj_key, str(e)

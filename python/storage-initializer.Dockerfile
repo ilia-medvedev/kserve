@@ -2,11 +2,27 @@ ARG PYTHON_VERSION=3.11
 ARG BASE_IMAGE=python:${PYTHON_VERSION}-slim-bookworm
 ARG VENV_PATH=/prod_venv
 
+ARG S5CMD_VERSION=2.3.0
 FROM ${BASE_IMAGE} AS builder
+
+# Re-declare build args for use in this stage
+ARG S5CMD_VERSION
+ARG TARGETARCH
 
 # Install all system dependencies first
 RUN apt-get update && apt-get install -y --no-install-recommends python3-dev curl build-essential && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+# Install s5cmd
+RUN case ${TARGETARCH} in \
+        "amd64")  S5CMD_ARCH="64bit"  ;; \
+        "arm64")  S5CMD_ARCH="arm64"  ;; \
+        *)        echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac && \
+    S5CMD_URL=https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-${S5CMD_ARCH}.tar.gz && \
+    echo "Downloading s5cmd from: $S5CMD_URL" && \
+    curl -L "$S5CMD_URL" | tar -xz -C /usr/local/bin && \
+    s5cmd version
+
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     ln -s /root/.local/bin/uv /usr/local/bin/uv
@@ -60,6 +76,9 @@ COPY --from=builder storage storage
 COPY ./storage-initializer /storage-initializer
 
 RUN chmod +x /storage-initializer/scripts/initializer-entrypoint
+
+# Copy s5cmd from the builder stage
+COPY --from=builder /usr/local/bin/s5cmd /usr/local/bin/s5cmd
 RUN mkdir /work
 WORKDIR /work
 
